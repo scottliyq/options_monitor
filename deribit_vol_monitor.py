@@ -222,6 +222,7 @@ def add_cluster_event(
 ) -> str | None:
     """
     Add event to cluster; return summary text if threshold reached and not recently sent.
+    发送汇总后清空队列，避免重复触发。
     """
     key = cluster_key(ins)
     dq = clusters[key]
@@ -230,15 +231,20 @@ def add_cluster_event(
     while dq and dq[0]["ts"] < cutoff:
         dq.popleft()
 
-    if len(dq) >= config.CLUSTER_THRESHOLD and ts - last_sent.get(key, 0) >= config.CLUSTER_WINDOW_SEC:
-        last_sent[key] = ts
-        kind_counts = Counter(ev["kind"] for ev in dq)
-        latest = dq[-1]["ins"]
-        summary = (
-            f"Cluster alert {key}: {len(dq)} events/{config.CLUSTER_WINDOW_SEC}s "
-            f"(thr {config.CLUSTER_THRESHOLD}); kinds {dict(kind_counts)}; latest {latest}"
-        )
-        return summary
+    if len(dq) >= config.CLUSTER_THRESHOLD:
+        # 检查是否距离上次汇总已经足够长时间，或者从未发送过
+        if ts - last_sent.get(key, 0) >= config.CLUSTER_WINDOW_SEC:
+            last_sent[key] = ts
+            kind_counts = Counter(ev["kind"] for ev in dq)
+            latest = dq[-1]["ins"]
+            event_count = len(dq)
+            summary = (
+                f"Cluster alert {key}: {event_count} events/{config.CLUSTER_WINDOW_SEC}s "
+                f"(thr {config.CLUSTER_THRESHOLD}); kinds {dict(kind_counts)}; latest {latest}"
+            )
+            # 清空队列，避免重复触发，需要重新累积事件
+            dq.clear()
+            return summary
     return None
 
 
