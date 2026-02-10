@@ -51,7 +51,7 @@ async def subscribe(ws, channels):
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "public/subscribe",
-                "params": {"channels": channels, "include_old": True},
+                "params": {"channels": channels},  # Removed include_old to avoid historical trades
             }
         )
     )
@@ -105,6 +105,17 @@ async def monitor() -> None:
     logger = logging.getLogger("large_trade_monitor")
     backoff = 1
     threshold = config.LARGE_TRADE_NOTIONAL
+    premium_threshold = config.LARGE_TRADE_PREMIUM
+    
+    # Debug: show config module location and raw values
+    logger.info("Config module loaded from: %s", config.__file__)
+    logger.info("Raw config values: LARGE_TRADE_NOTIONAL=%s, LARGE_TRADE_PREMIUM=%s", 
+                threshold, premium_threshold)
+    logger.info(
+        "Starting monitor with thresholds: NOTIONAL=$%s | PREMIUM=$%s",
+        f"{threshold:,}" if threshold else "None",
+        f"{premium_threshold:,}" if premium_threshold else "None"
+    )
     # Option trades streams; raw for fullest feed
     channels = [
         "trades.option.BTC.raw",
@@ -173,9 +184,15 @@ async def monitor() -> None:
                         trade["_index_price"] = idx or 0.0  # for alert context
                         trade["_premium_usd"] = premium_usd
                         
+                        # Debug: log all buy trades to diagnose false triggers
+                        logger.debug(
+                            "Processing buy trade %s: notional=$%.2f (thr=$%s) | premium=$%.2f (thr=$%s)",
+                            ins, notional, f"{threshold:,}", premium_usd, f"{premium_threshold:,}"
+                        )
+                        
                         # Check both thresholds (OR logic: either condition triggers alert)
                         notional_trigger = notional >= threshold
-                        premium_trigger = premium_usd >= config.LARGE_TRADE_PREMIUM
+                        premium_trigger = premium_usd >= premium_threshold
                         
                         if notional_trigger or premium_trigger:
                             # Log which condition(s) triggered
@@ -183,7 +200,7 @@ async def monitor() -> None:
                             if notional_trigger:
                                 triggers.append(f"notional ${notional:,.0f}>=${threshold:,.0f}")
                             if premium_trigger:
-                                triggers.append(f"premium ${premium_usd:,.0f}>=${config.LARGE_TRADE_PREMIUM:,.0f}")
+                                triggers.append(f"premium ${premium_usd:,.0f}>=${premium_threshold:,.0f}")
                             
                             text = format_trade_alert(trade, notional)
                             logger.warning(text.replace("\n", " | ") + f" | Triggered by: {' & '.join(triggers)}")

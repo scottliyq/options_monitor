@@ -35,4 +35,4 @@ CLUSTER_THRESHOLD = 3      # send one summary when >= this many alerts in window
 
 # Large aggressive trade alerts (options)
 LARGE_TRADE_NOTIONAL = 5000000     # USD underlying notional threshold (index_price * amount)
-LARGE_TRADE_PREMIUM = 1000      # USD premium threshold (price * amount)
+LARGE_TRADE_PREMIUM = 500000      # USD premium threshold (price * amount)
