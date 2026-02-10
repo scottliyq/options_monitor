@@ -28,3 +28,11 @@ ATM_STRIKES_PER_EXPIRY = 2
 OTM_EXPIRIES = 4          # include farther-dated OTM tails
 OTM_PER_SIDE = 2
 OTM_THRESHOLD = 0.20      # ±20% from spot counts as far OTM
+
+# Risk-duty clustering (reduce noisy per-contract alerts)
+CLUSTER_WINDOW_SEC = 120   # lookback window for clustering alerts
+CLUSTER_THRESHOLD = 3      # send one summary when >= this many alerts in window for same expiry
+
+# Large aggressive trade alerts (options)
+LARGE_TRADE_NOTIONAL = 5000000     # USD underlying notional threshold (index_price * amount)
+LARGE_TRADE_PREMIUM = 1000      # USD premium threshold (price * amount)

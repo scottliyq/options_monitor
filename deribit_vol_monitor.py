@@ -17,12 +17,15 @@ import asyncio
 import json
 import os
 import time
+import contextlib
 from collections import defaultdict, deque
 from statistics import mean, pstdev
 from typing import Deque, Dict, Iterable, List, Tuple
+from collections import Counter
 
 import aiohttp
 import websockets
+from dotenv import load_dotenv
 
 import config
 import logging
@@ -37,6 +40,8 @@ WS_URL = (
     if os.getenv("DERIBIT_TESTNET")
     else "wss://www.deribit.com/ws/api/v2"
 )
+
+load_dotenv()  # load .env once at import
 
 
 class RollingWindow:
@@ -167,6 +172,13 @@ def format_alert(title: str, body: str, extra: Dict) -> str:
     return " | ".join(bits)
 
 
+def cluster_key(ins: str) -> str:
+    parts = ins.split("-")
+    if parts:
+        return parts[0]  # group by underlying (BTC / ETH)
+    return ins
+
+
 async def send_webhook(text: str) -> None:
     url = os.getenv("ALERT_WEBHOOK")
     if not url:
@@ -176,6 +188,106 @@ async def send_webhook(text: str) -> None:
             await session.post(url, json={"text": text}, timeout=5)
         except Exception:
             pass  # avoid crashing monitor on webhook errors
+
+
+async def send_telegram(text: str) -> None:
+    """
+    Send message via Telegram Bot API.
+    Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in environment or .env.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    api_url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    async with aiohttp.ClientSession() as session:
+        try:
+            await session.post(api_url, json=payload, timeout=5)
+        except Exception:
+            pass
+
+
+async def notify(text: str) -> None:
+    await asyncio.gather(send_webhook(text), send_telegram(text))
+
+
+def add_cluster_event(
+    clusters: Dict[str, Deque[Dict]],
+    last_sent: Dict[str, float],
+    ins: str,
+    kind: str,
+    detail: str,
+    ts: float,
+) -> str | None:
+    """
+    Add event to cluster; return summary text if threshold reached and not recently sent.
+    """
+    key = cluster_key(ins)
+    dq = clusters[key]
+    dq.append({"ts": ts, "ins": ins, "kind": kind, "detail": detail})
+    cutoff = ts - config.CLUSTER_WINDOW_SEC
+    while dq and dq[0]["ts"] < cutoff:
+        dq.popleft()
+
+    if len(dq) >= config.CLUSTER_THRESHOLD and ts - last_sent.get(key, 0) >= config.CLUSTER_WINDOW_SEC:
+        last_sent[key] = ts
+        kind_counts = Counter(ev["kind"] for ev in dq)
+        latest = dq[-1]["ins"]
+        summary = (
+            f"Cluster alert {key}: {len(dq)} events/{config.CLUSTER_WINDOW_SEC}s "
+            f"(thr {config.CLUSTER_THRESHOLD}); kinds {dict(kind_counts)}; latest {latest}"
+        )
+        return summary
+    return None
+
+
+async def periodic_report(
+    logger: logging.Logger,
+    last_metrics: Dict[str, Dict[str, float]],
+    last_skew: Dict[str, Dict[str, float]],
+    oi_series: Dict[str, "RollingWindow"],
+) -> None:
+    """Log a summary snapshot immediately and then every 30 minutes."""
+    while True:
+        await log_snapshot(logger, last_metrics, last_skew, oi_series)
+        await asyncio.sleep(1800)
+
+
+async def log_snapshot(
+    logger: logging.Logger,
+    last_metrics: Dict[str, Dict[str, float]],
+    last_skew: Dict[str, Dict[str, float]],
+    oi_series: Dict[str, "RollingWindow"],
+) -> None:
+    spread_thr = "off" if config.SPREAD_WIDEN is None else f"{config.SPREAD_WIDEN:.1%}"
+    lines = [f"Snapshot ({len(last_metrics)} instruments)"]
+    for ins, m in list(last_metrics.items()):
+        spread_val = m.get("spread")
+        spread_str = "n/a" if spread_val is None else f"{spread_val:.1%}"
+        lines.append(
+            f"{ins}: z {m.get('z', float('nan')):.2f}/{config.PRICE_Z:.1f}, "
+            f"ΔIV {m.get('iv_jump', 0.0)*100:.2f}%/{config.IV_JUMP*100:.2f}%, "
+            f"move {m.get('move', 0.0)*100:.2f}%/{config.RET_PCT*100:.2f}%, "
+            f"spr {spread_str}/{spread_thr}"
+        )
+
+    for currency, s in last_skew.items():
+        skew = s.get("skew")
+        skew_change = s.get("skew_change")
+        lines.append(
+            f"{currency} skew { (skew or 0.0)*100:.2f}% (Δ { (skew_change or 0.0)*100:.2f}%) "
+            f"| invert<={config.SKEW_INV_ALERT*100:.2f}% jump>={config.SKEW_JUMP*100:.2f}%"
+        )
+
+    for currency, series in oi_series.items():
+        lines.append(
+            f"{currency} perp OI Δ {series.pct_move()*100:.2f}% / {config.OI_ACCEL_PCT*100:.2f}%"
+        )
+
+    snapshot_text = "\n".join(lines)
+    logger.info(snapshot_text.replace("\n", "\n  "))
+    await send_telegram(snapshot_text)
 
 
 async def build_watch_list(session: aiohttp.ClientSession) -> List[str]:
@@ -228,144 +340,184 @@ async def monitor() -> None:
                 latest_call_iv: Dict[str, float] = {}
                 latest_put_iv: Dict[str, float] = {}
                 oi_series: Dict[str, RollingWindow] = defaultdict(lambda: RollingWindow(config.WINDOW_SEC))    # key: BTC/ETH perp
+                last_metrics: Dict[str, Dict[str, float]] = {}  # last per-instrument snapshot
+                last_skew: Dict[str, Dict[str, float]] = {}     # last per-currency skew snapshot
+                clusters: Dict[str, Deque[Dict]] = defaultdict(deque)
+                cluster_last_sent: Dict[str, float] = {}
 
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    if msg.get("method") != "subscription":
-                        continue
-                    channel = msg["params"]["channel"]
-                    data = msg["params"]["data"]
-                    ts = data.get("timestamp", time.time())
+                # Pre-seed snapshots so the first log shows instrument list
+                for ins in watch_list:
+                    last_metrics[ins] = {"z": float("nan"), "iv_jump": 0.0, "move": 0.0, "spread": None}
 
-                    if channel.startswith("ticker."):
-                        ins = data["instrument_name"]
-                        mark = float(data["mark_price"])
-                        mark_iv = float(data.get("mark_iv", 0.0))
-                        bid = float(data.get("best_bid_price") or 0)
-                        ask = float(data.get("best_ask_price") or 0)
-                        underlying = float(
-                            data.get("underlying_price")
-                            or data.get("underlying_index_price")
-                            or mark
-                        )
-                        strike, right = _parse_option({"instrument_name": ins})
+                report_task = asyncio.create_task(periodic_report(logger, last_metrics, last_skew, oi_series))
+                # Immediate snapshot on startup
+                await log_snapshot(logger, last_metrics, last_skew, oi_series)
 
-                        # Futures / perp leverage monitor
-                        if ins.endswith("-PERPETUAL"):
-                            currency = ins.split("-")[0]
-                            oi = float(data.get("open_interest") or 0.0)
-                            oi_series[currency].add(ts, oi)
-                            if abs(oi_series[currency].pct_move()) >= config.OI_ACCEL_PCT:
+                try:
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        if msg.get("method") != "subscription":
+                            continue
+                        channel = msg["params"]["channel"]
+                        data = msg["params"]["data"]
+                        ts = data.get("timestamp", time.time())
+
+                        if channel.startswith("ticker."):
+                            ins = data["instrument_name"]
+                            mark = float(data["mark_price"])
+                            mark_iv = float(data.get("mark_iv", 0.0))
+                            bid = float(data.get("best_bid_price") or 0)
+                            ask = float(data.get("best_ask_price") or 0)
+                            underlying = float(
+                                data.get("underlying_price")
+                                or data.get("underlying_index_price")
+                                or mark
+                            )
+                            strike, right = _parse_option({"instrument_name": ins})
+
+                            # Futures / perp leverage monitor
+                            if ins.endswith("-PERPETUAL"):
+                                currency = ins.split("-")[0]
+                                oi = float(data.get("open_interest") or 0.0)
+                                oi_series[currency].add(ts, oi)
+                                if abs(oi_series[currency].pct_move()) >= config.OI_ACCEL_PCT:
+                                    text = format_alert(
+                                        "Perp OI accelerating",
+                                        f"{ins} OI +{oi_series[currency].pct_move():.1%} in {config.WINDOW_SEC}s",
+                                        {"oi": oi},
+                                    )
+                                    logger.warning(text)
+                                    summary = add_cluster_event(clusters, cluster_last_sent, ins, "oi", text, ts)
+                                    if summary:
+                                        logger.warning(summary)
+                                        await notify(summary)
+                                continue
+
+                            prices[ins].add(ts, mark)
+                            ivs[ins].add(ts, mark_iv)
+                            if bid and ask and mark:
+                                spread[ins].add(ts, (ask - bid) / mark)
+                            recent[ins].add(ts, mark)
+
+                            mean_p, std_p = prices[ins].stats()
+                            z = (mark - mean_p) / std_p if std_p and std_p > 0 else 0.0
+                            iv_mean, iv_std = ivs[ins].stats()
+                            iv_jump = abs(mark_iv - iv_mean) if not (iv_std != iv_std) else 0.0
+                            move = abs(recent[ins].pct_move())
+                            spr = spread[ins].data[-1][1] if spread[ins].data else 0.0
+                            last_metrics[ins] = {"z": z, "iv_jump": iv_jump, "move": move, "spread": spr}
+
+                            if z >= config.PRICE_Z:
                                 text = format_alert(
-                                    "Perp OI accelerating",
-                                    f"{ins} OI +{oi_series[currency].pct_move():.1%} in {config.WINDOW_SEC}s",
-                                    {"oi": oi},
+                                    "Price z-score spike",
+                                    f"{ins} z={z:.1f}",
+                                    {"mark": mark, "mean": f"{mean_p:.2f}", "std": f"{std_p:.2f}"},
                                 )
                                 logger.warning(text)
-                                await send_webhook(text)
-                            continue
+                                summary = add_cluster_event(clusters, cluster_last_sent, ins, "price", text, ts)
+                                if summary:
+                                    logger.warning(summary)
+                                    await notify(summary)
+                            is_far_otm = False
+                            if underlying > 0 and strike > 0 and right:
+                                is_far_otm = (
+                                    (right == "C" and strike >= underlying * 1.20)
+                                    or (right == "P" and strike <= underlying * 0.80)
+                                )
 
-                        prices[ins].add(ts, mark)
-                        ivs[ins].add(ts, mark_iv)
-                        if bid and ask and mark:
-                            spread[ins].add(ts, (ask - bid) / mark)
-                        recent[ins].add(ts, mark)
+                            if iv_jump >= config.IV_JUMP:
+                                label = "Far OTM IV jump" if is_far_otm else "IV jump"
+                                text = format_alert(
+                                    label,
+                                    f"{ins} ΔIV={iv_jump:.2%}",
+                                    {
+                                        "mark_iv": f"{mark_iv:.2%}",
+                                        "iv_mean": f"{iv_mean:.2%}",
+                                        "strike": strike,
+                                        "under": f"{underlying:.2f}",
+                                    },
+                                )
+                                logger.warning(text)
+                                summary = add_cluster_event(clusters, cluster_last_sent, ins, "iv", text, ts)
+                                if summary:
+                                    logger.warning(summary)
+                                    await notify(summary)
+                            if move >= config.RET_PCT:
+                                text = format_alert(
+                                    "Fast move",
+                                    f"{ins} {move:.2%} in {config.RET_WINDOW_SEC}s",
+                                    {"mark": mark},
+                                )
+                                logger.warning(text)
+                                summary = add_cluster_event(clusters, cluster_last_sent, ins, "move", text, ts)
+                                if summary:
+                                    logger.warning(summary)
+                                    await notify(summary)
+                            if config.SPREAD_WIDEN is not None and spr >= config.SPREAD_WIDEN:
+                                text = format_alert(
+                                    "Liquidity stress",
+                                    f"{ins} spread {spr:.1%}",
+                                    {"bid": bid, "ask": ask, "mark": mark},
+                                )
+                                logger.warning(text)
+                                summary = add_cluster_event(clusters, cluster_last_sent, ins, "spread", text, ts)
+                                if summary:
+                                    logger.warning(summary)
+                                    await notify(summary)
 
-                        mean_p, std_p = prices[ins].stats()
-                        z = (mark - mean_p) / std_p if std_p and std_p > 0 else 0.0
-                        iv_mean, iv_std = ivs[ins].stats()
-                        iv_jump = abs(mark_iv - iv_mean) if not (iv_std != iv_std) else 0.0
-                        move = abs(recent[ins].pct_move())
-                        spr = spread[ins].data[-1][1] if spread[ins].data else 0.0
+                            # Skew monitoring (25-delta RR proxy)
+                            if right:
+                                currency = ins.split("-")[0]
+                                delta_raw = data.get("greeks", {}).get("delta") if isinstance(data.get("greeks"), dict) else data.get("delta")
+                                try:
+                                    delta = float(delta_raw or 0.0)
+                                except Exception:
+                                    delta = 0.0
+                                if right == "C" and abs(delta - config.DELTA_TARGET) <= config.DELTA_BAND:
+                                    latest_call_iv[currency] = mark_iv
+                                elif right == "P" and abs(delta + config.DELTA_TARGET) <= config.DELTA_BAND:
+                                    latest_put_iv[currency] = mark_iv
 
-                        if z >= config.PRICE_Z:
-                            text = format_alert(
-                                "Price z-score spike",
-                                f"{ins} z={z:.1f}",
-                                {"mark": mark, "mean": f"{mean_p:.2f}", "std": f"{std_p:.2f}"},
-                            )
-                            logger.warning(text)
-                            await send_webhook(text)
-                        is_far_otm = False
-                        if underlying > 0 and strike > 0 and right:
-                            is_far_otm = (
-                                (right == "C" and strike >= underlying * 1.20)
-                                or (right == "P" and strike <= underlying * 0.80)
-                            )
+                                if currency in latest_call_iv and currency in latest_put_iv:
+                                    call_iv = latest_call_iv[currency]
+                                    put_iv = latest_put_iv[currency]
+                                    if not (call_iv != call_iv or put_iv != put_iv):
+                                        skew = call_iv - put_iv
+                                        skew_series[currency].add(ts, skew)
+                                        skew_mean, skew_std = skew_series[currency].stats()
+                                        skew_change = skew_series[currency].pct_move()
+                                        last_skew[currency] = {"skew": skew, "skew_change": skew_change}
 
-                        if iv_jump >= config.IV_JUMP:
-                            label = "Far OTM IV jump" if is_far_otm else "IV jump"
-                            text = format_alert(
-                                label,
-                                f"{ins} ΔIV={iv_jump:.2%}",
-                                {
-                                    "mark_iv": f"{mark_iv:.2%}",
-                                    "iv_mean": f"{iv_mean:.2%}",
-                                    "strike": strike,
-                                    "under": f"{underlying:.2f}",
-                                },
-                            )
-                            logger.warning(text)
-                            await send_webhook(text)
-                        if move >= config.RET_PCT:
-                            text = format_alert(
-                                "Fast move",
-                                f"{ins} {move:.2%} in {config.RET_WINDOW_SEC}s",
-                                {"mark": mark},
-                            )
-                            logger.warning(text)
-                            await send_webhook(text)
-                        if config.SPREAD_WIDEN is not None and spr >= config.SPREAD_WIDEN:
-                            text = format_alert(
-                                "Liquidity stress",
-                                f"{ins} spread {spr:.1%}",
-                                {"bid": bid, "ask": ask, "mark": mark},
-                            )
-                            logger.warning(text)
-                            await send_webhook(text)
+                                        if skew <= config.SKEW_INV_ALERT:
+                                            text = format_alert(
+                                                "Skew inverted (puts rich)",
+                                                f"{currency} skew={skew:.2%}",
+                                                {"call_iv": f"{call_iv:.2%}", "put_iv": f"{put_iv:.2%}"},
+                                            )
+                                            logger.warning(text)
+                                            summary = add_cluster_event(clusters, cluster_last_sent, ins, "skew", text, ts)
+                                            if summary:
+                                                logger.warning(summary)
+                                                await notify(summary)
+                                        elif abs(skew_change) >= config.SKEW_JUMP:
+                                            text = format_alert(
+                                                "Skew jump",
+                                                f"{currency} Δskew={skew_change:.2%} in {config.WINDOW_SEC}s",
+                                                {"skew": f"{skew:.2%}", "mean": f"{skew_mean:.2%}"},
+                                            )
+                                            logger.warning(text)
+                                            summary = add_cluster_event(clusters, cluster_last_sent, ins, "skew", text, ts)
+                                            if summary:
+                                                logger.warning(summary)
+                                                await notify(summary)
 
-                        # Skew monitoring (25-delta RR proxy)
-                        if right:
-                            currency = ins.split("-")[0]
-                            delta_raw = data.get("greeks", {}).get("delta") if isinstance(data.get("greeks"), dict) else data.get("delta")
-                            try:
-                                delta = float(delta_raw or 0.0)
-                            except Exception:
-                                delta = 0.0
-                            if right == "C" and abs(delta - config.DELTA_TARGET) <= config.DELTA_BAND:
-                                latest_call_iv[currency] = mark_iv
-                            elif right == "P" and abs(delta + config.DELTA_TARGET) <= config.DELTA_BAND:
-                                latest_put_iv[currency] = mark_iv
-
-                            if currency in latest_call_iv and currency in latest_put_iv:
-                                call_iv = latest_call_iv[currency]
-                                put_iv = latest_put_iv[currency]
-                                if not (call_iv != call_iv or put_iv != put_iv):
-                                    skew = call_iv - put_iv
-                                    skew_series[currency].add(ts, skew)
-                                    skew_mean, skew_std = skew_series[currency].stats()
-                                    skew_change = skew_series[currency].pct_move()
-
-                                    if skew <= config.SKEW_INV_ALERT:
-                                        text = format_alert(
-                                            "Skew inverted (puts rich)",
-                                            f"{currency} skew={skew:.2%}",
-                                            {"call_iv": f"{call_iv:.2%}", "put_iv": f"{put_iv:.2%}"},
-                                        )
-                                        logger.warning(text)
-                                        await send_webhook(text)
-                                    elif abs(skew_change) >= config.SKEW_JUMP:
-                                        text = format_alert(
-                                            "Skew jump",
-                                            f"{currency} Δskew={skew_change:.2%} in {config.WINDOW_SEC}s",
-                                            {"skew": f"{skew:.2%}", "mean": f"{skew_mean:.2%}"},
-                                        )
-                                        logger.warning(text)
-                                        await send_webhook(text)
-
-                    elif channel.startswith("deribit_price_index."):
-                        # could add underlying move-based alerts if desired
-                        pass
+                        elif channel.startswith("deribit_price_index."):
+                            # could add underlying move-based alerts if desired
+                            pass
+                finally:
+                    report_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await report_task
         except Exception as exc:
             logger.exception("Monitor error: %s; reconnecting in %ss", exc, backoff)
             await asyncio.sleep(backoff)
