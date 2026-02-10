@@ -172,9 +172,21 @@ async def monitor() -> None:
                         notional = usd_notional if usd_notional else premium_usd
                         trade["_index_price"] = idx or 0.0  # for alert context
                         trade["_premium_usd"] = premium_usd
-                        if notional >= threshold or premium_usd >= config.LARGE_TRADE_PREMIUM:
+                        
+                        # Check both thresholds (OR logic: either condition triggers alert)
+                        notional_trigger = notional >= threshold
+                        premium_trigger = premium_usd >= config.LARGE_TRADE_PREMIUM
+                        
+                        if notional_trigger or premium_trigger:
+                            # Log which condition(s) triggered
+                            triggers = []
+                            if notional_trigger:
+                                triggers.append(f"notional ${notional:,.0f}>=${threshold:,.0f}")
+                            if premium_trigger:
+                                triggers.append(f"premium ${premium_usd:,.0f}>=${config.LARGE_TRADE_PREMIUM:,.0f}")
+                            
                             text = format_trade_alert(trade, notional)
-                            logger.warning(text.replace("\n", " | "))
+                            logger.warning(text.replace("\n", " | ") + f" | Triggered by: {' & '.join(triggers)}")
                             await send_telegram(text)
 
         except Exception as exc:
