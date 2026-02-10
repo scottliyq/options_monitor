@@ -18,6 +18,7 @@ import json
 import os
 import time
 import contextlib
+import argparse
 from collections import defaultdict, deque
 from statistics import mean, pstdev
 from typing import Deque, Dict, Iterable, List, Tuple
@@ -43,6 +44,9 @@ WS_URL = (
 
 load_dotenv()  # load .env once at import
 
+# Global flag for Telegram notifications (set by command line argument)
+_ENABLE_TELEGRAM = False
+
 
 class RollingWindow:
     """Fixed-duration rolling window of (timestamp, value) points."""
@@ -52,16 +56,43 @@ class RollingWindow:
         self.data: Deque[Tuple[float, float]] = deque()
 
     def add(self, ts: float, value: float) -> None:
+        before_len = len(self.data)
         self.data.append((ts, value))
         cutoff = ts - self.seconds
+        removed = 0
         while self.data and self.data[0][0] < cutoff:
             self.data.popleft()
+            removed += 1
+        
+        # 调试：记录前几个数据点的详细信息
+        if before_len < 5:
+            import logging
+            logging.getLogger("deribit_monitor").info(
+                f"RollingWindow.add(): pts {before_len}->{len(self.data)}, "
+                f"ts={ts:.3f}, cutoff={cutoff:.3f}, window={self.seconds}s, "
+                f"removed={removed}, value={value:.4f}"
+            )
+        # 调试：如果数据被大量清除，记录警告
+        elif removed > 0 and len(self.data) < 2:
+            import logging
+            logging.getLogger("deribit_monitor").warning(
+                f"RollingWindow: Removed {removed} old points, only {len(self.data)} left. "
+                f"Current ts={ts:.3f}, cutoff={cutoff:.3f}, window={self.seconds}s"
+            )
 
     def stats(self) -> Tuple[float, float]:
+        """返回 (均值, 标准差)，数据点少于2时返回 (nan, nan)"""
         if len(self.data) < 2:
             return (float("nan"), float("nan"))
         vals = [v for _, v in self.data]
-        return mean(vals), pstdev(vals)
+        try:
+            m = mean(vals)
+            s = pstdev(vals)
+            return m, s
+        except Exception as e:
+            import logging
+            logging.getLogger("deribit_monitor").error(f"RollingWindow.stats() error: {e}, data_len={len(self.data)}")
+            return (float("nan"), float("nan"))
 
     def pct_move(self) -> float:
         if len(self.data) < 2:
@@ -78,6 +109,12 @@ async def http_get(session: aiohttp.ClientSession, path: str, params: Dict) -> D
     async with session.get(url, params=params, timeout=10) as resp:
         resp.raise_for_status()
         return await resp.json()
+
+
+async def fetch_ticker(session: aiohttp.ClientSession, instrument: str) -> Dict:
+    """Fetch current ticker data for an instrument."""
+    res = await http_get(session, "/public/ticker", {"instrument_name": instrument})
+    return res["result"]
 
 
 async def fetch_index_price(session: aiohttp.ClientSession, currency: str) -> float:
@@ -173,9 +210,14 @@ def format_alert(title: str, body: str, extra: Dict) -> str:
 
 
 def cluster_key(ins: str) -> str:
+    """
+    Group alerts by underlying + option right (C/P). Perps still group by underlying only.
+    """
     parts = ins.split("-")
+    if len(parts) >= 4:  # option format: BTC-11FEB26-69000-P
+        return f"{parts[0]}-{parts[-1]}"
     if parts:
-        return parts[0]  # group by underlying (BTC / ETH)
+        return parts[0]
     return ins
 
 
@@ -194,7 +236,10 @@ async def send_telegram(text: str) -> None:
     """
     Send message via Telegram Bot API.
     Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in environment or .env.
+    Controlled by --enable-telegram command line flag.
     """
+    if not _ENABLE_TELEGRAM:
+        return
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
@@ -253,11 +298,12 @@ async def periodic_report(
     last_metrics: Dict[str, Dict[str, float]],
     last_skew: Dict[str, Dict[str, float]],
     oi_series: Dict[str, "RollingWindow"],
+    prices: Dict[str, "RollingWindow"],
 ) -> None:
-    """Log a summary snapshot immediately and then every 30 minutes."""
+    """Log a summary snapshot every SNAPSHOT_INTERVAL_SEC seconds."""
     while True:
-        await log_snapshot(logger, last_metrics, last_skew, oi_series)
-        await asyncio.sleep(1800)
+        await asyncio.sleep(config.SNAPSHOT_INTERVAL_SEC)
+        await log_snapshot(logger, last_metrics, last_skew, oi_series, prices)
 
 
 async def log_snapshot(
@@ -265,17 +311,36 @@ async def log_snapshot(
     last_metrics: Dict[str, Dict[str, float]],
     last_skew: Dict[str, Dict[str, float]],
     oi_series: Dict[str, "RollingWindow"],
+    prices: Dict[str, "RollingWindow"],
 ) -> None:
     spread_thr = "off" if config.SPREAD_WIDEN is None else f"{config.SPREAD_WIDEN:.1%}"
-    lines = [f"Snapshot ({len(last_metrics)} instruments)"]
+    
+    # 统计有效数据的合约数量和数据点信息
+    valid_count = sum(1 for m in last_metrics.values() if m.get("z") == m.get("z"))  # 非NaN
+    total_data_points = sum(len(pw.data) for pw in prices.values())
+    max_pts = max((len(pw.data) for pw in prices.values()), default=0)
+    min_pts = min((len(pw.data) for pw in prices.values()), default=0) if prices else 0
+    
+    lines = [
+        f"Snapshot ({len(last_metrics)} instruments, {valid_count} with valid data)",
+        f"Data points: total={total_data_points}, min={min_pts}, max={max_pts}, window={config.WINDOW_SEC}s"
+    ]
+    
     for ins, m in list(last_metrics.items()):
         spread_val = m.get("spread")
         spread_str = "n/a" if spread_val is None else f"{spread_val:.1%}"
+        z_val = m.get('z', float('nan'))
+        z_str = f"{z_val:.2f}" if z_val == z_val else "nan"  # 检查是否为NaN
+        
+        # 添加数据点数量信息（仅在数据点少于10时显示）
+        pts = len(prices[ins].data) if ins in prices else 0
+        pts_str = f" pts={pts}" if pts < 10 else ""
+        
         lines.append(
-            f"{ins}: z {m.get('z', float('nan')):.2f}/{config.PRICE_Z:.1f}, "
+            f"{ins}: z {z_str}/{config.PRICE_Z:.1f}, "
             f"ΔIV {m.get('iv_jump', 0.0)*100:.2f}%/{config.IV_JUMP*100:.2f}%, "
             f"move {m.get('move', 0.0)*100:.2f}%/{config.RET_PCT*100:.2f}%, "
-            f"spr {spread_str}/{spread_thr}"
+            f"spr {spread_str}/{spread_thr}{pts_str}"
         )
 
     for currency, s in last_skew.items():
@@ -306,17 +371,81 @@ async def build_watch_list(session: aiohttp.ClientSession) -> List[str]:
     return watch
 
 
+async def fetch_initial_data(
+    session: aiohttp.ClientSession,
+    instruments: List[str],
+    prices: Dict[str, RollingWindow],
+    ivs: Dict[str, RollingWindow],
+    spread: Dict[str, RollingWindow],
+    recent: Dict[str, RollingWindow],
+    logger: logging.Logger,
+) -> None:
+    """Fetch initial ticker data for all instruments via HTTP API."""
+    logger.info("Fetching initial data for %d instruments...", len(instruments))
+    ts = time.time()
+    
+    for idx, ins in enumerate(instruments, 1):
+        try:
+            ticker = await fetch_ticker(session, ins)
+            mark = float(ticker["mark_price"])
+            mark_iv = float(ticker.get("mark_iv", 0.0))
+            bid = float(ticker.get("best_bid_price") or 0)
+            ask = float(ticker.get("best_ask_price") or 0)
+            
+            prices[ins].add(ts, mark)
+            ivs[ins].add(ts, mark_iv)
+            if bid and ask and mark:
+                spread[ins].add(ts, (ask - bid) / mark)
+            recent[ins].add(ts, mark)
+            
+            if idx % 10 == 0:
+                logger.info("  Fetched %d/%d instruments", idx, len(instruments))
+        except Exception as e:
+            logger.warning(f"Failed to fetch initial data for {ins}: {e}")
+    
+    logger.info("Initial data fetch complete")
+
+
 async def subscribe(ws, channels: Iterable[str]) -> None:
-    await ws.send(
-        json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 42,
-                "method": "public/subscribe",
-                "params": {"channels": list(channels)},
-            }
-        )
-    )
+    msg = {
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "public/subscribe",
+        "params": {"channels": list(channels)},
+    }
+    await ws.send(json.dumps(msg))
+
+
+async def auth(ws, logger: logging.Logger) -> str:
+    """Authenticate to Deribit WebSocket using client credentials."""
+    client_id = os.getenv("DERIBIT_CLIENT_ID")
+    client_secret = os.getenv("DERIBIT_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        logger.warning("DERIBIT_CLIENT_ID/SECRET not set, skipping authentication")
+        return ""
+    
+    req = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "public/auth",
+        "params": {
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+    }
+    await ws.send(json.dumps(req))
+    
+    # Wait for auth response
+    resp_raw = await ws.recv()
+    resp = json.loads(resp_raw)
+    
+    if resp.get("error"):
+        raise RuntimeError(f"Deribit auth error: {resp['error']}")
+    
+    token = resp.get("result", {}).get("access_token", "")
+    logger.info("Authenticated to Deribit (token length=%d)", len(token))
+    return token
 
 
 async def monitor() -> None:
@@ -335,8 +464,52 @@ async def monitor() -> None:
             logger.info("Subscribing to %d options...", len(watch_list))
             for idx, ins in enumerate(watch_list, 1):
                 logger.info("  [%d/%d] %s", idx, len(watch_list), ins)
+            
+            logger.info("Connecting to WebSocket: %s", WS_URL)
             async with websockets.connect(WS_URL, ping_interval=15, ping_timeout=10) as ws:
+                logger.info("WebSocket connected successfully")
+                
+                # Authenticate first
+                try:
+                    await auth(ws, logger)
+                except Exception as auth_err:
+                    logger.warning("Authentication failed: %s, continuing without auth...", auth_err)
+                
                 await subscribe(ws, channels)
+                logger.info("Subscription request sent for %d channels", len(channels))
+                
+                # Wait for subscription confirmation
+                subscription_confirmed = False
+                async def wait_for_confirmation():
+                    nonlocal subscription_confirmed
+                    try:
+                        async with asyncio.timeout(10):  # 10 second timeout
+                            while not subscription_confirmed:
+                                raw = await ws.recv()
+                                msg = json.loads(raw)
+                                
+                                # Log any non-subscription messages for debugging
+                                if msg.get("id") != 42 and msg.get("method") != "subscription":
+                                    logger.debug("Received message during wait: %s", str(msg)[:200])
+                                
+                                if msg.get("id") == 42:  # Subscription response
+                                    if "result" in msg:
+                                        result = msg["result"]
+                                        logger.info("Subscription confirmed: %d channels", len(result) if isinstance(result, list) else 0)
+                                        subscription_confirmed = True
+                                    elif "error" in msg:
+                                        logger.error("Subscription failed: %s", msg["error"])
+                                        raise RuntimeError(f"Subscription error: {msg['error']}")
+                                    break
+                                elif msg.get("method") == "subscription":
+                                    logger.info("Received first data before confirmation")
+                                    subscription_confirmed = True
+                                    break
+                    except asyncio.TimeoutError:
+                        logger.warning("Subscription confirmation timeout, continuing anyway...")
+                        subscription_confirmed = True
+                
+                await wait_for_confirmation()
                 backoff = 1
                 prices: Dict[str, RollingWindow] = defaultdict(lambda: RollingWindow(config.WINDOW_SEC))
                 ivs: Dict[str, RollingWindow] = defaultdict(lambda: RollingWindow(config.WINDOW_SEC))
@@ -350,23 +523,69 @@ async def monitor() -> None:
                 last_skew: Dict[str, Dict[str, float]] = {}     # last per-currency skew snapshot
                 clusters: Dict[str, Deque[Dict]] = defaultdict(deque)
                 cluster_last_sent: Dict[str, float] = {}
+                
+                # Fetch initial data via HTTP API to populate rolling windows
+                async with aiohttp.ClientSession() as http_session:
+                    await fetch_initial_data(http_session, watch_list, prices, ivs, spread, recent, logger)
 
                 # Pre-seed snapshots so the first log shows instrument list
                 for ins in watch_list:
                     last_metrics[ins] = {"z": float("nan"), "iv_jump": 0.0, "move": 0.0, "spread": None}
 
-                report_task = asyncio.create_task(periodic_report(logger, last_metrics, last_skew, oi_series))
-                # Immediate snapshot on startup
-                await log_snapshot(logger, last_metrics, last_skew, oi_series)
+                # Health check task
+                async def health_check():
+                    last_msg_count = 0
+                    while True:
+                        await asyncio.sleep(30)  # Check every 30 seconds
+                        msg_count = getattr(monitor, "_msg_count", 0)
+                        total_pts = sum(len(pw.data) for pw in prices.values())
+                        instruments_ready = sum(1 for pw in prices.values() if len(pw.data) >= 2)
+                        
+                        if msg_count > last_msg_count:
+                            logger.info(
+                                f"Health: {msg_count} msgs (+{msg_count - last_msg_count}), "
+                                f"{total_pts} pts, {instruments_ready}/{len(watch_list)} ready"
+                            )
+                            last_msg_count = msg_count
+                        else:
+                            logger.warning(f"Health: NO NEW MESSAGES in 30s! Total: {msg_count}")
 
+                report_task = asyncio.create_task(periodic_report(logger, last_metrics, last_skew, oi_series, prices))
+                health_task = asyncio.create_task(health_check())
+                
+                logger.info(f"Monitoring started. First snapshot in {config.SNAPSHOT_INTERVAL_SEC}s...")
                 try:
                     async for raw in ws:
                         msg = json.loads(raw)
+                        
+                        # Log first message received
+                        if not hasattr(monitor, "_first_msg_logged"):
+                            monitor._first_msg_logged = True
+                            logger.info(f"First WS message received: {str(msg)[:200]}...")
+                        
                         if msg.get("method") != "subscription":
                             continue
                         channel = msg["params"]["channel"]
                         data = msg["params"]["data"]
-                        ts = data.get("timestamp", time.time())
+                        
+                        # 修复：Deribit 返回的是毫秒时间戳，需要转换为秒
+                        ts_raw = data.get("timestamp", time.time() * 1000)
+                        ts = ts_raw / 1000.0 if ts_raw > 1e12 else ts_raw  # 如果是毫秒则转换
+                        
+                        # 验证时间戳合理性
+                        now = time.time()
+                        if abs(ts - now) > 3600:  # 相差超过1小时
+                            logger.warning(
+                                f"Suspicious timestamp: ts={ts}, now={now}, diff={ts-now:.0f}s, "
+                                f"ts_raw={ts_raw}, channel={channel}"
+                            )
+                        
+                        # 添加数据接收日志（每1000条记录一次）
+                        if not hasattr(monitor, "_msg_count"):
+                            monitor._msg_count = 0
+                        monitor._msg_count += 1
+                        if monitor._msg_count % 1000 == 1:
+                            logger.info(f"Received {monitor._msg_count} messages, latest: {channel}, ts={ts}")
 
                         if channel.startswith("ticker."):
                             ins = data["instrument_name"]
@@ -380,6 +599,16 @@ async def monitor() -> None:
                                 or mark
                             )
                             strike, right = _parse_option({"instrument_name": ins})
+                            
+                            # 调试：追踪第一条ticker数据
+                            if not hasattr(monitor, "_first_ticker_logged"):
+                                monitor._first_ticker_logged = set()
+                            if ins not in monitor._first_ticker_logged:
+                                monitor._first_ticker_logged.add(ins)
+                                logger.info(
+                                    f"First ticker for {ins}: mark={mark}, mark_iv={mark_iv:.4f}, "
+                                    f"bid={bid}, ask={ask}, ts={ts}, underlying={underlying}"
+                                )
 
                             # Futures / perp leverage monitor
                             if ins.endswith("-PERPETUAL"):
@@ -399,19 +628,86 @@ async def monitor() -> None:
                                         await notify(summary)
                                 continue
 
+                            # 添加数据到滚动窗口前记录
+                            data_pts_before = len(prices[ins].data)
+                            
                             prices[ins].add(ts, mark)
                             ivs[ins].add(ts, mark_iv)
                             if bid and ask and mark:
                                 spread[ins].add(ts, (ask - bid) / mark)
                             recent[ins].add(ts, mark)
+                            
+                            # 调试：检查数据是否被添加
+                            data_pts_after = len(prices[ins].data)
+                            if data_pts_after <= 5:  # 前5个数据点详细记录
+                                logger.info(
+                                    f"{ins}: Added data point #{data_pts_after}, ts={ts:.3f}, mark={mark:.4f}, "
+                                    f"mark_iv={mark_iv:.4f}, now={time.time():.3f}, age={time.time()-ts:.1f}s"
+                                )
+                            
+                            # 每1000条消息显示整体数据累积情况
+                            if monitor._msg_count % 1000 == 0:
+                                total_pts = sum(len(pw.data) for pw in prices.values())
+                                instruments_with_data = sum(1 for pw in prices.values() if len(pw.data) >= 2)
+                                logger.info(
+                                    f"Data accumulation: {total_pts} total points, "
+                                    f"{instruments_with_data}/{len(prices)} instruments have >=2 points"
+                                )
 
                             mean_p, std_p = prices[ins].stats()
-                            z = (mark - mean_p) / std_p if std_p and std_p > 0 else 0.0
+                            # 修复：正确处理 NaN 情况
+                            if std_p == std_p and std_p > 0:  # 检查非NaN且大于0
+                                z = (mark - mean_p) / std_p
+                            else:
+                                z = 0.0
+                            
                             iv_mean, iv_std = ivs[ins].stats()
-                            iv_jump = abs(mark_iv - iv_mean) if not (iv_std != iv_std) else 0.0
+                            # 修复：当 iv_mean 有效时才计算 iv_jump
+                            if iv_mean == iv_mean:  # 检查非NaN
+                                iv_jump = abs(mark_iv - iv_mean)
+                            else:
+                                iv_jump = 0.0
+                            
                             move = abs(recent[ins].pct_move())
-                            spr = spread[ins].data[-1][1] if spread[ins].data else 0.0
+                            spr = spread[ins].data[-1][1] if spread[ins].data else None
                             last_metrics[ins] = {"z": z, "iv_jump": iv_jump, "move": move, "spread": spr}
+
+                            # Composite gating: only fire when all key signals are hit
+                            if config.COMPOSITE_ALERT_ONLY:
+                                composite_hit = (
+                                    z >= config.PRICE_Z
+                                    and move >= config.RET_PCT
+                                    and iv_jump >= config.IV_JUMP
+                                    and (config.SPREAD_WIDEN is None or (spr is not None and spr >= config.SPREAD_WIDEN))
+                                )
+                                if composite_hit:
+                                    spr_fmt = f"{spr:.1%}" if spr is not None else "n/a"
+                                    text = format_alert(
+                                        "Composite vol alert",
+                                        f"{ins} z={z:.1f}, move={move:.2%}, ΔIV={iv_jump:.2%}, spread={spr_fmt}",
+                                        {
+                                            "mark": mark,
+                                            "iv_mean": f"{iv_mean:.2%}",
+                                            "skew": f"{last_skew.get(ins.split('-')[0], {}).get('skew', float('nan')):.2%}"
+                                            if last_skew.get(ins.split("-")[0])
+                                            else "n/a",
+                                        },
+                                    )
+                                    logger.warning(text)
+                                    summary = add_cluster_event(clusters, cluster_last_sent, ins, "composite", text, ts)
+                                    if summary:
+                                        logger.warning(summary)
+                                        await notify(summary)
+                                # Skip individual alerts when composite mode is on
+                                continue
+                            
+                            # 调试日志：每个合约前10个数据点 + 之后每100条
+                            if data_pts_after <= 10 or data_pts_after % 100 == 0:
+                                logger.debug(
+                                    f"{ins}: pts={data_pts_after}, z={z:.2f}, "
+                                    f"mean={mean_p:.2f}, std={std_p:.2f}, "
+                                    f"iv_jump={iv_jump:.4f}, move={move:.2%}, spread={spr}"
+                                )
 
                             if z >= config.PRICE_Z:
                                 text = format_alert(
@@ -522,8 +818,10 @@ async def monitor() -> None:
                             pass
                 finally:
                     report_task.cancel()
+                    health_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await report_task
+                        await health_task
         except Exception as exc:
             logger.exception("Monitor error: %s; reconnecting in %ss", exc, backoff)
             await asyncio.sleep(backoff)
@@ -531,12 +829,36 @@ async def monitor() -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Deribit BTC/ETH options volatility monitor",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Environment variables:
+  ALERT_WEBHOOK       Slack/Teams-compatible webhook URL for alerts
+  TELEGRAM_BOT_TOKEN  Telegram bot token (required for --enable-telegram)
+  TELEGRAM_CHAT_ID    Telegram chat ID (required for --enable-telegram)
+  DERIBIT_TESTNET     Set to "1" to use Deribit testnet
+  LOG_LEVEL           Logging level (default: INFO)
+        """
+    )
+    parser.add_argument(
+        "--enable-telegram",
+        action="store_true",
+        help="Enable Telegram notifications (default: disabled)"
+    )
+    args = parser.parse_args()
+    
+    # Set global flag
+    globals()["_ENABLE_TELEGRAM"] = args.enable_telegram
+    
     try:
         logging.basicConfig(
             level=os.getenv("LOG_LEVEL", "INFO"),
             format="%(asctime)s %(levelname)s %(name)s - %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
+        logger = logging.getLogger("deribit_monitor")
+        if args.enable_telegram:
+            logger.info("Telegram notifications enabled")
         asyncio.run(monitor())
     except KeyboardInterrupt:
         logging.getLogger("deribit_monitor").info("Stopped by user.")

@@ -33,6 +33,13 @@ OTM_THRESHOLD = 0.20      # ±20% from spot counts as far OTM
 CLUSTER_WINDOW_SEC = 300   # lookback window for clustering alerts
 CLUSTER_THRESHOLD = 5      # send one summary when >= this many alerts in window for same expiry
 
+# Composite gating: when True, send a single composite alert only if ALL key metrics are hit.
+# Metrics reused: PRICE_Z, RET_PCT, IV_JUMP, and SPREAD_WIDEN (if set).
+COMPOSITE_ALERT_ONLY = True
+
 # Large aggressive trade alerts (options)
 LARGE_TRADE_NOTIONAL = 5000000     # USD underlying notional threshold (index_price * amount)
 LARGE_TRADE_PREMIUM = 500000      # USD premium threshold (price * amount)
+
+# Snapshot reporting interval
+SNAPSHOT_INTERVAL_SEC = 300       # Time between periodic snapshots (5 minutes)
