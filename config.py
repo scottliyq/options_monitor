@@ -42,4 +42,4 @@ LARGE_TRADE_NOTIONAL = 5000000     # USD underlying notional threshold (index_pr
 LARGE_TRADE_PREMIUM = 500000      # USD premium threshold (price * amount)
 
 # Snapshot reporting interval
-SNAPSHOT_INTERVAL_SEC = 3600       # Time between periodic snapshots (5 minutes)
+SNAPSHOT_INTERVAL_SEC = 86400       # Time between periodic snapshots (5 minutes)
