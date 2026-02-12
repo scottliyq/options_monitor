@@ -30,13 +30,13 @@ BASE_WS = (
 )
 
 
-async def send_telegram(text: str) -> None:
+async def send_telegram(text: str, parse_mode: str = "HTML") -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
     async with aiohttp.ClientSession() as session:
         try:
             await session.post(url, json=payload, timeout=5)
@@ -92,12 +92,35 @@ def format_trade_alert(trade: dict, notional: float) -> str:
     human_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts / 1000))
     price_str = f"{price:.5f}".rstrip("0").rstrip(".") if price else "0"
     size_str = f"{amt:.4f}".rstrip("0").rstrip(".") if amt else "0"
+    
+    # Determine if it's a call or put option
+    is_call = "-C" in ins if ins else False
+    is_put = "-P" in ins if ins else False
+    
+    # Set color and emoji based on option type
+    if is_call:
+        emoji = "🟢"  # Green circle for CALL
+        color_tag_start = "<b><u>"
+        color_tag_end = "</u></b>"
+        option_type = "CALL"
+    elif is_put:
+        emoji = "🔴"  # Red circle for PUT
+        color_tag_start = "<b><u>"
+        color_tag_end = "</u></b>"
+        option_type = "PUT"
+    else:
+        emoji = "⚪"  # White circle for others
+        color_tag_start = ""
+        color_tag_end = ""
+        option_type = "OPTION"
+    
     return (
-        f"Large taker {side} {ins}\n"
-        f"Size: {size_str} @ {price_str}\n"
-        f"Notional (est): ${notional:,.0f} (index {idx:.2f} USD)\n"
-        f"Premium: ${premium_usd:,.2f} (price*size*index)\n"
-        f"Time (UTC): {human_ts}"
+        f"{emoji} {color_tag_start}Large {option_type} Taker {side.upper()}{color_tag_end}\n"
+        f"<b>Instrument:</b> <code>{ins}</code>\n"
+        f"<b>Size:</b> {size_str} @ {price_str}\n"
+        f"<b>Notional:</b> ${notional:,.0f} (index {idx:.2f} USD)\n"
+        f"<b>Premium:</b> ${premium_usd:,.2f}\n"
+        f"<b>Time (UTC):</b> {human_ts}"
     )
 
 
