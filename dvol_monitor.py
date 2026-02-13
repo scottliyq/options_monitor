@@ -198,7 +198,7 @@ async def fetch_dvol(session: aiohttp.ClientSession, currency: str) -> Optional[
             dvol_value = result.get("index_price") or result.get("edp")
             
             if dvol_value is not None:
-                logging.getLogger("dvol_monitor").info(
+                logging.getLogger("dvol_monitor").debug(
                     f"Successfully fetched {currency} DVOL: {float(dvol_value):.2f}"
                 )
                 return float(dvol_value)
@@ -237,7 +237,7 @@ async def fetch_price_index(session: aiohttp.ClientSession, currency: str) -> Op
             price_value = result.get("index_price")
             
             if price_value is not None:
-                logging.getLogger("dvol_monitor").info(
+                logging.getLogger("dvol_monitor").debug(
                     f"Successfully fetched {currency} Price: ${float(price_value):,.2f}"
                 )
                 return float(price_value)
