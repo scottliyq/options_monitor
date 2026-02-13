@@ -43,3 +43,9 @@ LARGE_TRADE_PREMIUM = 500000      # USD premium threshold (price * amount)
 
 # Snapshot reporting interval
 SNAPSHOT_INTERVAL_SEC = 86400       # Time between periodic snapshots (5 minutes)
+
+# DVOL (Volatility Index) monitor settings
+DVOL_WINDOW_SEC = 3600             # 1 hour rolling window for DVOL change detection
+DVOL_RISE_THRESHOLD = 0.05         # 5% DVOL rise in 1h (IV pulse)
+PRICE_DROP_THRESHOLD = -0.025      # -2.5% price drop in 1h (bearish filter)
+DVOL_SNAPSHOT_INTERVAL_SEC = 14400  # 4 hours snapshot interval (4 * 3600)

@@ -1,9 +1,10 @@
 # options_monitor
 
-Monitors Deribit BTC/ETH options for fast moves, IV/skew anomalies, and large aggressive trades. Ships two independent scripts:
+Monitors Deribit BTC/ETH options for fast moves, IV/skew anomalies, and large aggressive trades. Ships three independent scripts:
 
 - `deribit_vol_monitor.py`: real-time options/perp monitoring with alerts on price z-score, IV jumps, fast moves, skew shifts, and (optionally) liquidity stress.
 - `large_trade_monitor.py`: listens to Deribit option trade feed and alerts on large taker buys by USD notional or premium.
+- `dvol_monitor.py`: monitors DVOL (Deribit Volatility Index) for IV pulse events combined with price drops.
 
 ## Requirements
 
@@ -23,6 +24,7 @@ Key knobs (defaults shown):
 - Instrument selection: `ATM_EXPIRIES=4`, `OTM_EXPIRIES=4`, `ATM_STRIKES_PER_EXPIRY=2`, `OTM_PER_SIDE=2`, `OTM_THRESHOLD=0.20`
 - Clustered duty alerts: `CLUSTER_WINDOW_SEC=120`, `CLUSTER_THRESHOLD=3`
 - Large trades (options): `LARGE_TRADE_NOTIONAL` (USD notional via index * size), `LARGE_TRADE_PREMIUM` (USD premium via price * size * index)
+- DVOL monitor: `DVOL_WINDOW_SEC=3600` (1h window), `DVOL_RISE_THRESHOLD=0.05` (5% DVOL rise), `PRICE_DROP_THRESHOLD=-0.025` (-2.5% price drop)
 
 ## Environment (`.env`)
 
@@ -57,6 +59,17 @@ python large_trade_monitor.py
 ```
 - Authenticates with Deribit, subscribes to `trades.option.BTC/ETH`.
 - Alerts when `notional >= LARGE_TRADE_NOTIONAL` **or** `premium >= LARGE_TRADE_PREMIUM`.
+
+4) DVOL (Volatility Index) monitor:
+```bash
+python dvol_monitor.py
+```
+- Monitors BTC and ETH DVOL indices for IV pulse events.
+- Alerts when **both conditions** are met simultaneously:
+  - DVOL 1h rise ≥ 5% (configurable via `DVOL_RISE_THRESHOLD`)
+  - Price 1h drop ≤ -2.5% (configurable via `PRICE_DROP_THRESHOLD`)
+- Sends highlighted Telegram alerts with detailed metrics.
+- 10-minute cooldown between alerts per currency to avoid spam.
 
 ## Notes
 
