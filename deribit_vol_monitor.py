@@ -480,36 +480,35 @@ async def monitor() -> None:
                 
                 # Wait for subscription confirmation
                 subscription_confirmed = False
-                async def wait_for_confirmation():
+                async def wait_for_confirmation_inner():
                     nonlocal subscription_confirmed
-                    try:
-                        async with asyncio.timeout(10):  # 10 second timeout
-                            while not subscription_confirmed:
-                                raw = await ws.recv()
-                                msg = json.loads(raw)
-                                
-                                # Log any non-subscription messages for debugging
-                                if msg.get("id") != 42 and msg.get("method") != "subscription":
-                                    logger.debug("Received message during wait: %s", str(msg)[:200])
-                                
-                                if msg.get("id") == 42:  # Subscription response
-                                    if "result" in msg:
-                                        result = msg["result"]
-                                        logger.info("Subscription confirmed: %d channels", len(result) if isinstance(result, list) else 0)
-                                        subscription_confirmed = True
-                                    elif "error" in msg:
-                                        logger.error("Subscription failed: %s", msg["error"])
-                                        raise RuntimeError(f"Subscription error: {msg['error']}")
-                                    break
-                                elif msg.get("method") == "subscription":
-                                    logger.info("Received first data before confirmation")
-                                    subscription_confirmed = True
-                                    break
-                    except asyncio.TimeoutError:
-                        logger.warning("Subscription confirmation timeout, continuing anyway...")
-                        subscription_confirmed = True
+                    while not subscription_confirmed:
+                        raw = await ws.recv()
+                        msg = json.loads(raw)
+                        
+                        # Log any non-subscription messages for debugging
+                        if msg.get("id") != 42 and msg.get("method") != "subscription":
+                            logger.debug("Received message during wait: %s", str(msg)[:200])
+                        
+                        if msg.get("id") == 42:  # Subscription response
+                            if "result" in msg:
+                                result = msg["result"]
+                                logger.info("Subscription confirmed: %d channels", len(result) if isinstance(result, list) else 0)
+                                subscription_confirmed = True
+                            elif "error" in msg:
+                                logger.error("Subscription failed: %s", msg["error"])
+                                raise RuntimeError(f"Subscription error: {msg['error']}")
+                            break
+                        elif msg.get("method") == "subscription":
+                            logger.info("Received first data before confirmation")
+                            subscription_confirmed = True
+                            break
                 
-                await wait_for_confirmation()
+                try:
+                    await asyncio.wait_for(wait_for_confirmation_inner(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Subscription confirmation timeout, continuing anyway...")
+                    subscription_confirmed = True
                 backoff = 1
                 prices: Dict[str, RollingWindow] = defaultdict(lambda: RollingWindow(config.WINDOW_SEC))
                 ivs: Dict[str, RollingWindow] = defaultdict(lambda: RollingWindow(config.WINDOW_SEC))
