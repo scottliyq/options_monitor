@@ -12,6 +12,7 @@ Monitors Deribit BTC/ETH options for fast moves, IV/skew anomalies, and large ag
 - Install deps: `pip install -r requirements.txt`
 - Deribit API key for option trades feed (public/auth): set `DERIBIT_CLIENT_ID` / `DERIBIT_CLIENT_SECRET` in `.env`. Use `DERIBIT_TESTNET=1` to target testnet.
 - Telegram bot for alerts: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`. Webhook alerts also supported via `ALERT_WEBHOOK`.
+- Pushover emergency alerts (DVOL alerts only): `PUSHOVER_USER_KEY` and `PUSHOVER_API_TOKEN` in `.env`.
 
 ## Configuration (`config.py`)
 
@@ -33,10 +34,14 @@ DERIBIT_CLIENT_ID=xxx
 DERIBIT_CLIENT_SECRET=yyy
 TELEGRAM_BOT_TOKEN=zzz
 TELEGRAM_CHAT_ID=123456
+PUSHOVER_USER_KEY=your_user_key
+PUSHOVER_API_TOKEN=your_app_token
 # Optional
 ALERT_WEBHOOK=https://...
 DERIBIT_TESTNET=1   # omit for mainnet
 LOG_LEVEL=INFO
+PUSHOVER_RETRY_SEC=60   # optional, emergency alert repeat interval
+PUSHOVER_EXPIRE_SEC=3600 # optional, emergency alert max duration
 ```
 
 ## Running
@@ -69,6 +74,7 @@ python dvol_monitor.py
   - DVOL 1h rise ≥ 5% (configurable via `DVOL_RISE_THRESHOLD`)
   - Price 1h drop ≤ -2.5% (configurable via `PRICE_DROP_THRESHOLD`)
 - Sends highlighted Telegram alerts with detailed metrics.
+- Sends Pushover emergency alerts (`priority=2`) together with Telegram when an alert triggers.
 - 10-minute cooldown between alerts per currency to avoid spam.
 
 ## Notes

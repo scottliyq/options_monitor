@@ -19,9 +19,11 @@ Environment:
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
+import re
 import time
 from collections import defaultdict, deque
 from typing import Deque, Dict, Optional, Tuple
@@ -100,6 +102,48 @@ async def send_telegram(text: str, parse_mode: str = "HTML") -> None:
                     )
         except Exception as exc:
             logging.getLogger("dvol_monitor").exception(f"Failed to send Telegram message: {exc}")
+
+
+def to_plain_text(text: str) -> str:
+    """Convert HTML-formatted message to plain text for Pushover."""
+    without_tags = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(without_tags)
+
+
+async def send_pushover_emergency(text: str, title: str = "DVOL Alert") -> None:
+    """Send emergency-priority Pushover notification (repeats until acknowledged/expired)."""
+    user_key = os.getenv("PUSHOVER_USER_KEY")
+    api_token = os.getenv("PUSHOVER_API_TOKEN")
+    if not user_key or not api_token:
+        logging.getLogger("dvol_monitor").warning(
+            "PUSHOVER_USER_KEY or PUSHOVER_API_TOKEN not set, skipping Pushover notification"
+        )
+        return
+
+    retry_seconds = os.getenv("PUSHOVER_RETRY_SEC", "60")
+    expire_seconds = os.getenv("PUSHOVER_EXPIRE_SEC", "3600")
+    payload = {
+        "token": api_token,
+        "user": user_key,
+        "title": title,
+        "message": to_plain_text(text),
+        "priority": "2",
+        "retry": retry_seconds,
+        "expire": expire_seconds,
+    }
+
+    url = "https://api.pushover.net/1/messages.json"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(url, data=payload, timeout=5) as resp:
+                if resp.status != 200:
+                    logging.getLogger("dvol_monitor").error(
+                        f"Pushover API error: status={resp.status}, text={await resp.text()}"
+                    )
+        except Exception as exc:
+            logging.getLogger("dvol_monitor").exception(
+                f"Failed to send Pushover message: {exc}"
+            )
 
 
 def format_dvol_alert(
@@ -417,6 +461,10 @@ async def monitor() -> None:
                         
                         # Send to Telegram
                         await send_telegram(alert_text)
+                        await send_pushover_emergency(
+                            alert_text,
+                            title=f"{currency} DVOL IV PULSE ALERT",
+                        )
                         
                         # Update last alert time
                         last_alert_time[currency] = ts
