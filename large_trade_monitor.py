@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Monitor large aggressive buy trades on Deribit BTC/ETH perps and alert via Telegram.
+Monitor large aggressive option trades on Deribit and alert via Telegram.
 
 Config:
   - LARGE_TRADE_NOTIONAL (USD) in config.py controls alert threshold.
@@ -177,21 +177,25 @@ async def monitor() -> None:
                     if trades:
                         max_notional = 0.0
                         buy_count = 0
+                        sell_count = 0
                         for trade in trades:
                             price = float(trade.get("price") or 0.0)
                             amt = float(trade.get("amount") or 0.0)
                             if trade.get("direction") == "buy":
                                 buy_count += 1
+                            elif trade.get("direction") == "sell":
+                                sell_count += 1
                             max_notional = max(max_notional, price * amt)
                         logger.debug(
-                            "Received %d trades on %s (buys %d, max notional %.2f)",
+                            "Received %d trades on %s (buys %d, sells %d, max notional %.2f)",
                             len(trades),
                             channel,
                             buy_count,
+                            sell_count,
                             max_notional,
                         )
                     for trade in trades:
-                        if trade.get("direction") != "buy":
+                        if trade.get("direction") not in {"buy", "sell"}:
                             continue
                         ins = trade.get("instrument_name", "")
                         # skip perps/futures; keep options only
@@ -207,10 +211,10 @@ async def monitor() -> None:
                         trade["_index_price"] = idx or 0.0  # for alert context
                         trade["_premium_usd"] = premium_usd
                         
-                        # Debug: log all buy trades to diagnose false triggers
+                        # Debug: log all buy/sell trades to diagnose false triggers
                         logger.debug(
-                            "Processing buy trade %s: notional=$%.2f (thr=$%s) | premium=$%.2f (thr=$%s)",
-                            ins, notional, f"{threshold:,}", premium_usd, f"{premium_threshold:,}"
+                            "Processing %s trade %s: notional=$%.2f (thr=$%s) | premium=$%.2f (thr=$%s)",
+                            trade.get("direction"), ins, notional, f"{threshold:,}", premium_usd, f"{premium_threshold:,}"
                         )
                         
                         # Check both thresholds (OR logic: either condition triggers alert)
