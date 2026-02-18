@@ -26,7 +26,7 @@ import os
 import re
 import time
 from collections import defaultdict, deque
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 import aiohttp
 from dotenv import load_dotenv
@@ -252,7 +252,12 @@ async def fetch_dvol(session: aiohttp.ClientSession, currency: str) -> Optional[
             )
             return None
     except Exception as exc:
-        logging.getLogger("dvol_monitor").error(f"Exception fetching DVOL for {currency}: {exc}")
+        logging.getLogger("dvol_monitor").exception(
+            "Exception fetching DVOL for %s (index_name=%s): %s",
+            currency,
+            f"{currency.lower()}dvol_usdc",
+            f"{type(exc).__name__}: {exc}",
+        )
         return None
 
 
@@ -291,8 +296,174 @@ async def fetch_price_index(session: aiohttp.ClientSession, currency: str) -> Op
             )
             return None
     except Exception as exc:
-        logging.getLogger("dvol_monitor").error(f"Exception fetching price for {currency}: {exc}")
+        logging.getLogger("dvol_monitor").exception(
+            "Exception fetching price for %s (index_name=%s): %s",
+            currency,
+            f"{currency.lower()}_usd",
+            f"{type(exc).__name__}: {exc}",
+        )
         return None
+
+
+async def fetch_instruments(session: aiohttp.ClientSession, currency: str) -> List[Dict]:
+    """Fetch non-expired option instruments for a currency."""
+    try:
+        url = f"{BASE_URL}/public/get_instruments"
+        params = {"currency": currency, "kind": "option", "expired": "false"}
+        async with session.get(url, params=params, timeout=10) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logging.getLogger("dvol_monitor").debug(
+                    f"Failed to fetch instruments for {currency}: status={resp.status}, body={text[:200]}"
+                )
+                return []
+            data = await resp.json()
+            return data.get("result", []) or []
+    except Exception as exc:
+        logging.getLogger("dvol_monitor").error(f"Exception fetching instruments for {currency}: {exc}")
+        return []
+
+
+async def fetch_ticker(session: aiohttp.ClientSession, instrument: str) -> Optional[Dict]:
+    """Fetch current ticker data for an instrument."""
+    try:
+        url = f"{BASE_URL}/public/ticker"
+        params = {"instrument_name": instrument}
+        async with session.get(url, params=params, timeout=10) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logging.getLogger("dvol_monitor").debug(
+                    f"Failed to fetch ticker for {instrument}: status={resp.status}, body={text[:200]}"
+                )
+                return None
+            data = await resp.json()
+            return data.get("result")
+    except Exception as exc:
+        logging.getLogger("dvol_monitor").error(f"Exception fetching ticker for {instrument}: {exc}")
+        return None
+
+
+def _dte_days(expiry_ts_ms: int, now_ts: float) -> float:
+    """Days to expiry given ms timestamp and current seconds."""
+    return (expiry_ts_ms / 1000.0 - now_ts) / 86400.0
+
+
+async def fetch_put_candidates(
+    session: aiohttp.ClientSession,
+    currency: str,
+    index_price: float,
+    now_ts: float,
+) -> List[Dict]:
+    instruments = await fetch_instruments(session, currency)
+    if not instruments:
+        return []
+
+    dte_min = config.SELL_PUT_DTE_MIN
+    dte_max = config.SELL_PUT_DTE_MAX
+    delta_target = config.SELL_PUT_DELTA_TARGET
+    delta_band = config.SELL_PUT_DELTA_BAND
+    delta_min = -(delta_target + delta_band)
+    delta_max = -(delta_target - delta_band)
+    max_concurrency = max(1, int(config.SELL_PUT_MAX_CONCURRENCY))
+
+    filtered: List[Dict] = []
+    for ins in instruments:
+        option_type = ins.get("option_type") or ""
+        if option_type.lower() != "put" and not str(ins.get("instrument_name", "")).endswith("-P"):
+            continue
+        expiry_ts = int(ins.get("expiration_timestamp") or 0)
+        if not expiry_ts:
+            continue
+        dte = _dte_days(expiry_ts, now_ts)
+        if dte < dte_min or dte > dte_max:
+            continue
+        filtered.append(ins)
+
+    if not filtered:
+        return []
+
+    sem = asyncio.Semaphore(max_concurrency)
+    candidates: List[Dict] = []
+
+    async def build_candidate(ins: Dict) -> Optional[Dict]:
+        name = ins.get("instrument_name")
+        if not name:
+            return None
+        async with sem:
+            ticker = await fetch_ticker(session, name)
+        if not ticker:
+            return None
+        greeks = ticker.get("greeks") if isinstance(ticker.get("greeks"), dict) else {}
+        delta_raw = greeks.get("delta") if isinstance(greeks, dict) else None
+        if delta_raw is None:
+            delta_raw = ticker.get("delta")
+        try:
+            delta = float(delta_raw)
+        except Exception:
+            return None
+        if not (delta_min <= delta <= delta_max):
+            return None
+
+        bid = float(ticker.get("best_bid_price") or 0.0)
+        ask = float(ticker.get("best_ask_price") or 0.0)
+        mark = float(ticker.get("mark_price") or 0.0)
+        if bid > 0 and ask > 0:
+            mid = (bid + ask) / 2.0
+        else:
+            mid = mark
+        if mid <= 0:
+            return None
+
+        mark_iv = float(ticker.get("mark_iv") or 0.0)
+        premium_usd = mid * index_price
+        score = premium_usd / abs(delta) if delta != 0 else 0.0
+
+        expiry_ts = int(ins.get("expiration_timestamp") or 0)
+        strike = float(ins.get("strike") or 0.0)
+        return {
+            "instrument_name": name,
+            "expiry_ts": expiry_ts,
+            "strike": strike,
+            "delta": delta,
+            "mark_iv": mark_iv,
+            "mid_price": mid,
+            "premium_usd": premium_usd,
+            "score": score,
+        }
+
+    tasks = [build_candidate(ins) for ins in filtered]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    for item in results:
+        if item:
+            candidates.append(item)
+    return candidates
+
+
+def format_put_candidates_message(currency: str, candidates: List[Dict]) -> str:
+    """Format top put candidates as HTML snippet."""
+    if not candidates:
+        return f"<b>🧾 {currency} PUT Candidates:</b> 无可用候选"
+
+    topn = config.SELL_PUT_TOPN
+    header = f"<b>🧾 {currency} PUT Candidates (Top {topn}):</b>"
+    lines = [header]
+    for c in candidates[:topn]:
+        expiry_str = time.strftime("%Y-%m-%d", time.gmtime(c["expiry_ts"] / 1000.0))
+        ins = html.escape(c["instrument_name"])
+        lines.append(
+            "  • <code>{}</code> exp={} strike={:.0f} delta={:.3f} iv={:.2%} "
+            "mid={:.6f} premium=${:,.0f} score={:.0f}".format(
+                ins,
+                expiry_str,
+                c["strike"],
+                c["delta"],
+                c["mark_iv"],
+                c["mid_price"],
+                c["premium_usd"],
+                c["score"],
+            )
+        )
+    return "\n".join(lines)
 
 
 async def monitor() -> None:
@@ -451,6 +622,16 @@ async def monitor() -> None:
                             old_dvol=old_dvol,
                             old_price=old_price,
                         )
+
+                        # Append top sell-put candidates (reuse existing alert channel)
+                        candidates = await fetch_put_candidates(
+                            session=session,
+                            currency=currency,
+                            index_price=current_price,
+                            now_ts=ts,
+                        )
+                        candidates.sort(key=lambda x: x["score"], reverse=True)
+                        alert_text = f"{alert_text}\n\n{format_put_candidates_message(currency, candidates)}"
                         
                         # Log alert
                         logger.warning(
