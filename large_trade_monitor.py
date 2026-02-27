@@ -93,29 +93,37 @@ def format_trade_alert(trade: dict, notional: float) -> str:
     price_str = f"{price:.5f}".rstrip("0").rstrip(".") if price else "0"
     size_str = f"{amt:.4f}".rstrip("0").rstrip(".") if amt else "0"
     
-    # Determine if it's a call or put option
+    # Determine option type
     is_call = "-C" in ins if ins else False
     is_put = "-P" in ins if ins else False
+    side_upper = (side or "").upper()
     
-    # Set color and emoji based on option type
+    # Signal mapping for option flow sentiment in alerts:
+    # - sell put => bullish (green)
+    # - sell call => bearish (red)
+    # Keep buy-side mapping intuitive as well (buy call bullish / buy put bearish).
+    is_bullish = (is_put and side == "sell") or (is_call and side == "buy")
+    is_bearish = (is_call and side == "sell") or (is_put and side == "buy")
+
+    if is_bullish:
+        emoji = "🟢"
+    elif is_bearish:
+        emoji = "🔴"
+    else:
+        emoji = "⚪"
+
+    color_tag_start = "<b><u>"
+    color_tag_end = "</u></b>"
+
     if is_call:
-        emoji = "🟢"  # Green circle for CALL
-        color_tag_start = "<b><u>"
-        color_tag_end = "</u></b>"
         option_type = "CALL"
     elif is_put:
-        emoji = "🔴"  # Red circle for PUT
-        color_tag_start = "<b><u>"
-        color_tag_end = "</u></b>"
         option_type = "PUT"
     else:
-        emoji = "⚪"  # White circle for others
-        color_tag_start = ""
-        color_tag_end = ""
         option_type = "OPTION"
     
     return (
-        f"{emoji} {color_tag_start}Large {option_type} Taker {side.upper()}{color_tag_end}\n"
+        f"{emoji} {color_tag_start}Large {option_type} Taker {side_upper}{color_tag_end}\n"
         f"<b>Instrument:</b> <code>{ins}</code>\n"
         f"<b>Size:</b> {size_str} @ {price_str}\n"
         f"<b>Notional:</b> ${notional:,.0f} (index {idx:.2f} USD)\n"
