@@ -31,6 +31,8 @@ from dotenv import load_dotenv
 import config
 import logging
 
+load_dotenv()  # load .env once at import, must precede os.getenv calls below
+
 BASE_URL = (
     "https://test.deribit.com/api/v2"
     if os.getenv("DERIBIT_TESTNET")
@@ -41,8 +43,6 @@ WS_URL = (
     if os.getenv("DERIBIT_TESTNET")
     else "wss://www.deribit.com/ws/api/v2"
 )
-
-load_dotenv()  # load .env once at import
 
 # Global flag for Telegram notifications (set by command line argument)
 _ENABLE_TELEGRAM = False
@@ -845,9 +845,10 @@ if __name__ == "__main__":
         help="Enable Telegram notifications (default: disabled)"
     )
     args = parser.parse_args()
-    
+
     # Set global flag
-    globals()["_ENABLE_TELEGRAM"] = args.enable_telegram
+    global _ENABLE_TELEGRAM
+    _ENABLE_TELEGRAM = args.enable_telegram
     
     try:
         logging.basicConfig(
